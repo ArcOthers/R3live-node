@@ -10,6 +10,10 @@ using namespace std;
 
 typedef pcl::PointXYZINormal PointType;
 
+const bool time_list_cut_frame(PointType &x, PointType &y) {
+    return (x.curvature < y.curvature);
+}
+
 ros::Publisher pub_full, pub_surf, pub_corn;
 
 enum LID_TYPE
@@ -17,6 +21,7 @@ enum LID_TYPE
     MID,
     HORIZON,
     VELO16,
+    HESAI16,
     OUST64
 };
 
@@ -82,6 +87,7 @@ void   mid_handler( const sensor_msgs::PointCloud2::ConstPtr &msg );
 void   horizon_handler( const livox_ros_driver::CustomMsg::ConstPtr &msg );
 void   velo16_handler( const sensor_msgs::PointCloud2::ConstPtr &msg );
 void   oust64_handler( const sensor_msgs::PointCloud2::ConstPtr &msg );
+void   hesai_handler( const sensor_msgs::PointCloud2::ConstPtr &msg );
 void   give_feature( pcl::PointCloud< PointType > &pl, vector< orgtype > &types, pcl::PointCloud< PointType > &pl_corn,
                      pcl::PointCloud< PointType > &pl_surf );
 void   pub_func( pcl::PointCloud< PointType > &pl, ros::Publisher pub, const ros::Time &ct );
@@ -138,6 +144,11 @@ int main( int argc, char **argv )
     case VELO16:
         printf( "VELO16\n" );
         sub_points = n.subscribe( "/velodyne_points", 1000, velo16_handler, ros::TransportHints().tcpNoDelay() );
+        break;
+
+    case HESAI16:
+        printf("Hesai\n");
+        sub_points = n.subscribe("/hesai/pandar16", 1000, hesai_handler, ros::TransportHints().tcpNoDelay());
         break;
 
     case OUST64:
@@ -380,6 +391,64 @@ void oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
     pub_func( pl_processed, pub_corn, msg->header.stamp );
 }
 
+namespace hesai_pointcloud {
+
+struct EIGEN_ALIGN16 PointXYZIR {
+    PCL_ADD_POINT4D;
+    float intensity;
+    double timestamp;
+    uint16_t ring;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+}EIGEN_ALIGN16;
+}  // namespace ouster_ros
+
+// clang-format off
+POINT_CLOUD_REGISTER_POINT_STRUCT(hesai_pointcloud::PointXYZIR,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, intensity, intensity)
+    (double, timestamp, timestamp)
+    // use std::uint32_t to avoid conflicting with pcl::uint32_t
+    (std::uint16_t, ring, ring)
+)
+void hesai_handler( const sensor_msgs::PointCloud2::ConstPtr &msg )
+{
+    pcl::PointCloud< PointType > pl_processed;
+    pcl::PointCloud< hesai_pointcloud::PointXYZIR > pl_orig;
+    // pcl::PointCloud<pcl::PointXYZI> pl_orig;
+    pcl::fromROSMsg( *msg, pl_orig );
+    uint plsize = pl_orig.size();
+
+    double time_stamp = msg->header.stamp.toSec();
+    pl_processed.clear();
+    pl_processed.reserve( pl_orig.points.size() );
+    #pragma omp for
+    for ( int i = 0; i < pl_orig.points.size(); i++ )
+    {
+        double range = std::sqrt( pl_orig.points[ i ].x * pl_orig.points[ i ].x + pl_orig.points[ i ].y * pl_orig.points[ i ].y +
+                                pl_orig.points[ i ].z * pl_orig.points[ i ].z );
+        Eigen::Vector3d pt_vec;
+        PointType       added_pt;
+        added_pt.x = pl_orig.points[ i ].x;
+        added_pt.y = pl_orig.points[ i ].y;
+        added_pt.z = pl_orig.points[ i ].z;
+        added_pt.intensity = pl_orig.points[ i ].intensity;
+        added_pt.normal_x = 0;
+        added_pt.normal_y = 0;
+        added_pt.normal_z = 0;
+
+        added_pt.curvature = ( pl_orig.points[ i ].timestamp - time_stamp ) * 1000.0;
+        if ( range < blind || isnan(added_pt.x) || isnan(added_pt.y) || isnan(added_pt.z))
+            continue;
+        if (pl_orig.points[i].ring >= 0 && pl_orig.points[i].ring < N_SCANS)
+            pl_processed.points.push_back( added_pt );
+    }
+    sort(pl_processed.points.begin(), pl_processed.points.end(), time_list_cut_frame);
+    pub_func( pl_processed, pub_full, msg->header.stamp );
+    pub_func( pl_processed, pub_surf, msg->header.stamp );
+    pub_func( pl_processed, pub_corn, msg->header.stamp );
+}
 
 void give_feature( pcl::PointCloud< PointType > &pl, vector< orgtype > &types, pcl::PointCloud< PointType > &pl_corn,
                    pcl::PointCloud< PointType > &pl_surf )
